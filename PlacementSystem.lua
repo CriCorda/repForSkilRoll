@@ -15,15 +15,17 @@ local UIS = game:GetService("UserInputService")
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CAS = game:GetService("ContextActionService")
 
 -- Configuration
 local GRID_SIZE = 10
 local MAX_DISTANCE = 1000
 local GRID_TEXTURE_ID = "rbxassetid://71966238444315"
+local SPRING_STIFFNESS = 15
+local SPRING_DAMPING = 0.6
 
 -- Variables
 local plr = Players.LocalPlayer
-
 local assets = ReplicatedStorage:WaitForChild("Assets")
 
 local PlacementSystem = {}
@@ -38,9 +40,55 @@ function PlacementSystem.new()
 	self.VisualGrid = nil
 	self.CurrentModelName = ""
 	self.CurrentRotation = 0
+	self.VisualRotation = 0
 	self.CanPlace = true
 	
+	self.TargetCFrame = CFrame.new()
+	self.CurrentCFrame = CFrame.new()
+	self.Velocity = Vector3.new()
+	
+	self.ShakeOffset = Vector3.new()
+	
 	return self
+end
+
+--[[
+	Function that calculates and applies spring-dampened motion to the preview model
+	This is used to handle position smoothing, rotation interpolation and invalid-state shaking
+]]
+function PlacementSystem:ApplySpring(dt)
+	-- Position smoothing via spring
+	local displacement = (self.TargetCFrame.Position - self.CurrentCFrame.Position)
+	local force = displacement * SPRING_STIFFNESS
+	self.Velocity = (self.Velocity * SPRING_DAMPING) + (force * dt)
+	
+	-- Smooth rotation interpolation
+	local rotationSpeed = 15
+	self.VisualRotation = math.lerp(self.VisualRotation, self.CurrentRotation, math.clamp(dt * rotationSpeed, 0, 1))
+	
+	local shake = Vector3.new()
+	
+	-- Shake effect when attempting to place in an invalid location
+	if not self.CanPlace and UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+		shake = Vector3.new(math.random(-2, 2) / 10, 0, math.random(-2, 2) / 10)
+	end
+	
+	local newPos = self.CurrentCFrame.Position + self.Velocity + shake
+	
+	local rotationCFrame = CFrame.Angles(0, math.rad(self.VisualRotation), 0)
+	self.CurrentCFrame = CFrame.new(newPos) * rotationCFrame
+end
+
+-- Function that calculates the final CFrame based on grid snapping and surface normals
+function PlacementSystem:CalculatePlacementCFrame(pos, normal)
+	local snappedX = math.round(pos.X / GRID_SIZE) * GRID_SIZE
+	local snappedZ = math.round(pos.Z / GRID_SIZE) * GRID_SIZE
+	
+	local modelSize = self.PreviewModel:GetExtentsSize()
+	
+	local heightOffset = normal * (modelSize.Y / 2)
+	
+	return CFrame.new(Vector3.new(snappedX, pos.Y, snappedZ) + heightOffset)
 end
 
 -- Function to create or remove the visual grid overlay
@@ -83,32 +131,34 @@ function PlacementSystem:CalculateGrid(pos)
 	return Vector3.new(x, pos.Y, z)
 end
 
+-- Function that determines the input source (Mouse or Touch) and returns the 2D screen position.
+function PlacementSystem:GetInputLocation()
+	if UIS.TouchEnabled and not UIS.MouseEnabled then
+		if UIS:GetLastInputType() == Enum.UserInputType.Touch then
+			return UIS:GetMouseLocation()
+		end
+		
+		local viewportSize = workspace.CurrentCamera.ViewportSize
+		return Vector2.new(viewportSize.X / 2, viewportSize.Y / 2)
+	end
+	return UIS:GetMouseLocation()
+end
+
 -- Functions that performs a raycast from the mouse position to find a valid surface
 function PlacementSystem:GetMouseTarget()
-	local mousePos = UIS:GetMouseLocation()
-	local viewportRay = workspace.CurrentCamera:ViewportPointToRay(mousePos.X, mousePos.Y)
-	
-	local filterList = { self.PreviewModel, plr.Character }
-	
+	local inputPos = self:GetInputLocation()
+	local viewportRay = workspace.CurrentCamera:ViewportPointToRay(inputPos.X, inputPos.Y)
+
 	local raycastParams = RaycastParams.new()
-	raycastParams.FilterDescendantsInstances = { filterList }
+	raycastParams.FilterDescendantsInstances = {self.PreviewModel, plr.Character}
 	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-	raycastParams.IgnoreWater = true
-	
+
 	local result = workspace:Raycast(viewportRay.Origin, viewportRay.Direction * MAX_DISTANCE, raycastParams)
-	
+
 	if result then
 		return result.Position, result.Instance, result.Normal
-	else
-		local t = -viewportRay.Origin.Y / viewportRay.Direction.Y
-		
-		if t > 0 then
-			local hitPoint = viewportRay.Origin + viewportRay.Direction * t
-			return hitPoint, nil, Vector3.new(0, 1, 0)
-		end
 	end
-	
-	return viewportRay.Origin + (viewportRay.Direction * MAX_DISTANCE), nil, Vector3.new(0, 1, 0)
+	return nil
 end
 
 -- Function that checks for collisions
@@ -168,59 +218,74 @@ function PlacementSystem:PlaceObject()
 	finalModel.Parent = workspace
 end
 
+-- Action handlers for ContextActionService
+
 -- Function to handle the input for rotation, activation and object placement
+function PlacementSystem:HandleRotation(actionName, inputState, inputObject)
+	if inputState ~= Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
+	
+	if actionName == "RotateAction" then
+		self.CurrentRotation += 90
+	elseif actionName == "RotateActionCounter" then
+		self.CurrentRotation -= 90
+	end
+	return Enum.ContextActionResult.Pass
+end
+
+function PlacementSystem:HandleCancel(actionName, inputState, inputObject)
+	if inputState == Enum.UserInputState.Begin then
+		self:Deactivate()
+	end
+	return Enum.ContextActionResult.Pass
+end
+
+function PlacementSystem:HandlePlace(actionName, inputState, inputObject)
+	if inputState == Enum.UserInputState.Begin then
+		if self.CanPlace then
+			self:PlaceObject()
+		else
+			self.Velocity = self.Velocity + Vector3.new(0, 5, 0)
+		end
+	end
+	return Enum.ContextActionResult.Pass
+end
+
 function PlacementSystem:HandleInput(input, gp)
 	if gp then return end
 	
-	if input.KeyCode == Enum.KeyCode.E then
+	if input.KeyCode == Enum.KeyCode.E and not self.IsActive then
 		self:Activate("Model1")
-		return
-	end
-	
-	if self.IsActive then
-		if input.KeyCode == Enum.KeyCode.R then
-			self.CurrentRotation = (self.CurrentRotation + 90) % 360
-		end
-		
-		if input.KeyCode == Enum.KeyCode.Q then
-			self.CurrentRotation = (self.CurrentRotation - 90) % 360
-		end
-		
-		if input.KeyCode == Enum.KeyCode.X then
-			self:Deactivate()
-		end
-
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			if self.CanPlace then
-				self:PlaceObject()
-			else
-				print("Cannot place!")
-			end
-		end
 	end
 end
 
--- Update called every frame.
+-- Update called via RenderStepped.
 -- It calculates the target position, rotation, and checks for collisions.
-function PlacementSystem:Update()
+function PlacementSystem:Update(dt)
 	if not self.IsActive or not self.PreviewModel then return end
+
+	local pos, hitInstance, normal = self:GetMouseTarget()
 	
-	local targetPos, targetPart, targetNormal = self:GetMouseTarget()
-	local snappedPos = self:CalculateGrid(targetPos)
+	local charPos = plr.Character and plr.Character.PrimaryPart and plr.Character.PrimaryPart.Position
+	local distance = charPos and pos and (charPos - pos).Magnitude or 0
 	
-	-- Normal.Y > 0.9 to ensure the surface is flat enough to place on
-	local isGround = targetPart ~= nil and targetNormal.Y > 0.9
+	-- Ensure normal is valid and surface is facing upwards
+	local isTopFace = normal and normal.Y > 0.9
 	
-	local modelSize = self.PreviewModel:GetExtentsSize()
+	if not pos or not normal or distance > MAX_DISTANCE or not isTopFace then
+		self.TargetCFrame = plr.Character.PrimaryPart.CFrame * CFrame.new(0, 0, -10)
+		self:ApplySpring(dt)
+		self.PreviewModel:PivotTo(self.CurrentCFrame)
+		
+		self.CanPlace = false
+		self:CheckCollisions(false)
+		return
+	end
 	
-	-- Construct the CFrame for the preview model
-	local finalCFrame = CFrame.new(snappedPos + Vector3.new(0, modelSize.Y / 2, 0))
-		* CFrame.Angles(0, math.rad(self.CurrentRotation), 0)
-	
-	-- Lerp the preview model to the target position with a smooth transition
-	self.PreviewModel:PivotTo(self.PreviewModel:GetPivot():Lerp(finalCFrame, 0.2))
-	
-	self:CheckCollisions(isGround)
+	self.TargetCFrame = self:CalculatePlacementCFrame(pos, normal)
+	self:ApplySpring(dt)
+
+	self.PreviewModel:PivotTo(self.CurrentCFrame)
+	self:CheckCollisions(hitInstance ~= nil)
 end
 
 -- Function to activate the system for a specific model
@@ -241,6 +306,7 @@ function PlacementSystem:Activate(modelName)
 	self.CurrentModelName = modelName
 	self.PreviewModel = template:Clone()
 	
+	-- Prepares preview visual state
 	for _, part in ipairs(self.PreviewModel:GetDescendants()) do
 		if part:IsA("BasePart") then
 			part.Transparency = 0.5
@@ -255,6 +321,19 @@ function PlacementSystem:Activate(modelName)
 	self.CurrentRotation = 0
 	
 	self:ToggleVisualGrid(true)
+	
+	-- Bind cross-platform actions
+	CAS:BindAction("RotateAction", function(...) return self:HandleRotation(...) end, true, Enum.KeyCode.R, Enum.KeyCode.ButtonX)
+	CAS:BindAction("RotateActionCounter", function(...) return self:HandleRotation(...) end, true, Enum.KeyCode.Q, Enum.KeyCode.ButtonY)
+	CAS:BindAction("CancelAction", function(...) return self:HandleCancel(...) end, true, Enum.KeyCode.X, Enum.KeyCode.ButtonB)
+	CAS:BindAction("PlaceAction", function(...) return self:HandlePlace(...) end, true, Enum.UserInputType.MouseButton1, Enum.UserInputType.Touch, Enum.KeyCode.ButtonR2)
+
+	if UIS.TouchEnabled then
+		CAS:SetTitle("RotateAction", "Rotate ->")
+		CAS:SetTitle("RotateActionCounter", "<- Rotate")
+		CAS:SetTitle("CancelAction", "Exit")
+		CAS:SetTitle("PlaceAction", "Place")
+	end
 end
 
 -- Function that cleans the preview up and resets state
@@ -267,6 +346,11 @@ function PlacementSystem:Deactivate()
 	end
 	
 	self:ToggleVisualGrid(false)
+	
+	CAS:UnbindAction("RotateAction")
+	CAS:UnbindAction("RotateActionCounter")
+	CAS:UnbindAction("CancelAction")
+	CAS:UnbindAction("PlaceAction")
 end
 
 -- Initializes the system
@@ -280,6 +364,6 @@ plr.CharacterAdded:Connect(function()
 	system:Deactivate()
 end)
 
-RunService.RenderStepped:Connect(function()
-	system:Update()
+RunService.RenderStepped:Connect(function(dt)
+	system:Update(dt)
 end)
